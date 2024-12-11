@@ -21,69 +21,59 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
-	"github.com/IrineSistiana/mosdns/v4/pkg/dnsutils"
-	"github.com/IrineSistiana/mosdns/v4/pkg/query_context"
-	"github.com/IrineSistiana/mosdns/v4/pkg/utils"
-	"github.com/miekg/dns"
-	"go.uber.org/zap"
-	"io"
 	"net"
+	"net/netip"
 	"time"
+
+	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
+	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
+	"go.uber.org/zap"
 )
 
 const (
-	serverTCPWriteTimeout = time.Second
 	defaultTCPIdleTimeout = time.Second * 10
-	tcpFirstReadTimeout   = time.Millisecond * 500
+	tcpFirstReadTimeout   = time.Second * 2
 )
 
-type tcpResponseWriter struct {
-	c net.Conn
+type TCPServerOpts struct {
+	// Nil logger == nop
+	Logger *zap.Logger
+
+	// Default is defaultTCPIdleTimeout.
+	IdleTimeout time.Duration
 }
 
-func (t *tcpResponseWriter) Write(m *dns.Msg) error {
-	t.c.SetWriteDeadline(time.Now().Add(serverTCPWriteTimeout))
-	_, err := dnsutils.WriteMsgToTCP(t.c, m)
-	return err
-}
-
-func (s *Server) ServeTCP(l net.Listener) error {
-	defer l.Close()
-
-	closer := l.(io.Closer)
-	if ok := s.trackCloser(&closer, true); !ok {
-		return ErrServerClosed
+// ServeTCP starts a server at l. It returns if l had an Accept() error.
+// It always returns a non-nil error.
+func ServeTCP(l net.Listener, h Handler, opts TCPServerOpts) error {
+	logger := opts.Logger
+	if logger == nil {
+		logger = nopLogger
 	}
-	defer s.trackCloser(&closer, false)
+	idleTimeout := opts.IdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = defaultTCPIdleTimeout
+	}
+	firstReadTimeout := tcpFirstReadTimeout
+	if idleTimeout < firstReadTimeout {
+		firstReadTimeout = idleTimeout
+	}
 
-	listenerCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	listenerCtx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(errListenerCtxCanceled)
 	for {
 		c, err := l.Accept()
 		if err != nil {
-			if s.Closed() {
-				return ErrServerClosed
-			}
 			return fmt.Errorf("unexpected listener err: %w", err)
 		}
 
-		tcpConnCtx, cancelConn := context.WithCancel(listenerCtx)
+		// handle connection
+		tcpConnCtx, cancelConn := context.WithCancelCause(listenerCtx)
 		go func() {
 			defer c.Close()
-			defer cancelConn()
-
-			closer := c.(io.Closer)
-			if !s.trackCloser(&closer, true) {
-				return
-			}
-			defer s.trackCloser(&closer, false)
-
-			firstReadTimeout := tcpFirstReadTimeout
-			idleTimeout := s.getIdleTimeout()
-			if idleTimeout < firstReadTimeout {
-				firstReadTimeout = idleTimeout
-			}
+			defer cancelConn(errConnectionCtxCanceled)
 
 			firstRead := true
 			for {
@@ -98,21 +88,29 @@ func (s *Server) ServeTCP(l net.Listener) error {
 					return // read err, close the connection
 				}
 
+				// Try to get server name from tls conn.
+				var serverName string
+				if tlsConn, ok := c.(*tls.Conn); ok {
+					serverName = tlsConn.ConnectionState().ServerName
+				}
+
+				// handle query
 				go func() {
-					meta := new(query_context.RequestMeta)
-					if clientIP := utils.GetIPFromAddr(c.RemoteAddr()); clientIP != nil {
-						meta.ClientIP = clientIP
-					} else {
-						s.getLogger().Warn("failed to acquire client ip addr")
+					var clientAddr netip.Addr
+					ta, ok := c.RemoteAddr().(*net.TCPAddr)
+					if ok {
+						clientAddr = ta.AddrPort().Addr()
 					}
-					if err := s.DNSHandler.ServeDNS(
-						tcpConnCtx,
-						req,
-						&tcpResponseWriter{c: c},
-						meta,
-					); err != nil {
-						s.getLogger().Warn("handler err", zap.Error(err))
-						c.Close()
+					r := h.Handle(tcpConnCtx, req, QueryMeta{ClientAddr: clientAddr, ServerName: serverName}, pool.PackTCPBuffer)
+					if r == nil {
+						c.Close() // abort the connection
+						return
+					}
+					defer pool.ReleaseBuf(r)
+
+					if _, err := c.Write(*r); err != nil {
+						logger.Warn("failed to write response", zap.Stringer("client", c.RemoteAddr()), zap.Error(err))
+						return
 					}
 				}()
 			}

@@ -20,7 +20,7 @@
 package tools
 
 import (
-	"github.com/IrineSistiana/mosdns/v4/coremain"
+	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/spf13/cobra"
 )
 
@@ -35,16 +35,6 @@ func init() {
 		newPipelineCmd(),
 	)
 	coremain.AddSubCmd(probeCmd)
-
-	v2datCmd := &cobra.Command{
-		Use:   "v2dat",
-		Short: "Tools that can unpack v2ray data file to text files.",
-	}
-	v2datCmd.AddCommand(
-		newUnpackDomainCmd(),
-		newUnpackIPCmd(),
-	)
-	coremain.AddSubCmd(v2datCmd)
 
 	configCmd := &cobra.Command{
 		Use:   "config",

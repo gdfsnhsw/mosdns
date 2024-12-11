@@ -20,23 +20,71 @@
 package transport
 
 import (
-	"context"
+	"encoding/binary"
+	"io"
+
+	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
 	"github.com/miekg/dns"
-	"time"
+	"go.uber.org/zap"
+	"golang.org/x/exp/constraints"
 )
 
-// getContextDeadline tries to get the deadline of ctx or return a default
-// deadline.
-func getContextDeadline(ctx context.Context, defTimeout time.Duration) time.Time {
-	ddl, ok := ctx.Deadline()
-	if ok {
-		return ddl
+const (
+	dnsHeaderLen = 12 // minimum dns msg size
+)
+
+func copyMsgWithLenHdr(m []byte) (*[]byte, error) {
+	l := len(m)
+	if l > dns.MaxMsgSize {
+		return nil, ErrPayloadOverFlow
 	}
-	return time.Now().Add(defTimeout)
+	bp := pool.GetBuf(l + 2)
+	binary.BigEndian.PutUint16(*bp, uint16(l))
+	copy((*bp)[2:], m)
+	return bp, nil
 }
 
-func shadowCopy(m *dns.Msg) *dns.Msg {
-	nm := new(dns.Msg)
-	*nm = *m
-	return nm
+func copyMsg(m []byte) *[]byte {
+	bp := pool.GetBuf(len(m))
+	copy((*bp), m)
+	return bp
+}
+
+// readMsgUdp reads dns frame from r. r typically should be a udp connection.
+// It uses a 4kb rx buffer and ignores any payload that is too small for a dns msg.
+// If no error, the length of payload always >= 12 bytes.
+func readMsgUdp(r io.Reader) (*[]byte, error) {
+	// TODO: Make this configurable?
+	// 4kb should be enough.
+	payload := pool.GetBuf(4095)
+
+readAgain:
+	n, err := r.Read(*payload)
+	if err != nil {
+		pool.ReleaseBuf(payload)
+		return nil, err
+	}
+	if n < dnsHeaderLen {
+		goto readAgain
+	}
+	*payload = (*payload)[:n]
+	return payload, err
+}
+
+func setDefaultGZ[T constraints.Float | constraints.Integer](i *T, s, d T) {
+	if s > 0 {
+		*i = s
+	} else {
+		*i = d
+	}
+}
+
+var nopLogger = zap.NewNop()
+
+func setNonNilLogger(i **zap.Logger, s *zap.Logger) {
+	if s != nil {
+		*i = s
+	} else {
+		*i = nopLogger
+	}
 }

@@ -23,19 +23,15 @@ package ipset
 
 import (
 	"context"
-	"github.com/IrineSistiana/mosdns/v4/coremain"
-	"github.com/IrineSistiana/mosdns/v4/pkg/executable_seq"
-	"github.com/IrineSistiana/mosdns/v4/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 )
 
-type ipsetPlugin struct {
-	*coremain.BP
+type ipSetPlugin struct{}
+
+func newIpSetPlugin(_ *Args) (*ipSetPlugin, error) {
+	return &ipSetPlugin{}, nil
 }
 
-func newIpsetPlugin(bp *coremain.BP, args *Args) (*ipsetPlugin, error) {
-	return &ipsetPlugin{BP: bp}, nil
-}
-
-func (p *ipsetPlugin) Exec(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) error {
-	return executable_seq.ExecChainNode(ctx, qCtx, next)
+func (p *ipSetPlugin) Exec(_ context.Context, _ *query_context.Context) error {
+	return nil
 }

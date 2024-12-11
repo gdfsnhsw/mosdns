@@ -22,66 +22,68 @@ package hosts
 import (
 	"bytes"
 	"context"
-	"github.com/IrineSistiana/mosdns/v4/coremain"
-	"github.com/IrineSistiana/mosdns/v4/pkg/executable_seq"
-	"github.com/IrineSistiana/mosdns/v4/pkg/hosts"
-	"github.com/IrineSistiana/mosdns/v4/pkg/matcher/domain"
-	"github.com/IrineSistiana/mosdns/v4/pkg/query_context"
+	"fmt"
+	"github.com/IrineSistiana/mosdns/v5/coremain"
+	"github.com/IrineSistiana/mosdns/v5/pkg/hosts"
+	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/domain"
+	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
+	"github.com/miekg/dns"
+	"os"
 )
 
 const PluginType = "hosts"
 
 func init() {
-	coremain.RegNewPluginFunc(PluginType, Init, func() interface{} { return new(Args) })
+	coremain.RegNewPluginFunc(PluginType, Init, func() any { return new(Args) })
 }
 
-var _ coremain.ExecutablePlugin = (*hostsPlugin)(nil)
+var _ sequence.Executable = (*Hosts)(nil)
 
 type Args struct {
-	Hosts []string `yaml:"hosts"`
+	Entries []string `yaml:"entries"`
+	Files   []string `yaml:"files"`
 }
 
-type hostsPlugin struct {
-	*coremain.BP
+type Hosts struct {
 	h *hosts.Hosts
 }
 
-func Init(bp *coremain.BP, args interface{}) (p coremain.Plugin, err error) {
-	return newHostsContainer(bp, args.(*Args))
+func Init(_ *coremain.BP, args any) (any, error) {
+	return NewHosts(args.(*Args))
 }
 
-func newHostsContainer(bp *coremain.BP, args *Args) (*hostsPlugin, error) {
-	staticMatcher := domain.NewMixMatcher[*hosts.IPs]()
-	staticMatcher.SetDefaultMatcher(domain.MatcherFull)
-	m, err := domain.BatchLoadProvider[*hosts.IPs](
-		args.Hosts,
-		staticMatcher,
-		hosts.ParseIPs,
-		bp.M().GetDataManager(),
-		func(b []byte) (domain.Matcher[*hosts.IPs], error) {
-			mixMatcher := domain.NewMixMatcher[*hosts.IPs]()
-			mixMatcher.SetDefaultMatcher(domain.MatcherFull)
-			if err := domain.LoadFromTextReader[*hosts.IPs](mixMatcher, bytes.NewReader(b), hosts.ParseIPs); err != nil {
-				return nil, err
-			}
-			return mixMatcher, nil
-		},
-	)
-	if err != nil {
-		return nil, err
+func NewHosts(args *Args) (*Hosts, error) {
+	m := domain.NewMixMatcher[*hosts.IPs]()
+	m.SetDefaultMatcher(domain.MatcherFull)
+	for i, entry := range args.Entries {
+		if err := domain.Load[*hosts.IPs](m, entry, hosts.ParseIPs); err != nil {
+			return nil, fmt.Errorf("failed to load entry #%d %s, %w", i, entry, err)
+		}
 	}
-	return &hostsPlugin{
-		BP: bp,
-		h:  hosts.NewHosts(m),
+	for i, file := range args.Files {
+		b, err := os.ReadFile(file)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read file #%d %s, %w", i, file, err)
+		}
+		if err := domain.LoadFromTextReader[*hosts.IPs](m, bytes.NewReader(b), hosts.ParseIPs); err != nil {
+			return nil, fmt.Errorf("failed to load file #%d %s, %w", i, file, err)
+		}
+	}
+
+	return &Hosts{
+		h: hosts.NewHosts(m),
 	}, nil
 }
 
-func (h *hostsPlugin) Exec(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) error {
+func (h *Hosts) Response(q *dns.Msg) *dns.Msg {
+	return h.h.LookupMsg(q)
+}
+
+func (h *Hosts) Exec(_ context.Context, qCtx *query_context.Context) error {
 	r := h.h.LookupMsg(qCtx.Q())
 	if r != nil {
-		qCtx.SetResponse(r, query_context.ContextStatusResponded)
-		return nil
+		qCtx.SetResponse(r)
 	}
-
-	return executable_seq.ExecChainNode(ctx, qCtx, next)
+	return nil
 }

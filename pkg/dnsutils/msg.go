@@ -129,7 +129,6 @@ func QtypeToString(u uint16) string {
 func GenEmptyReply(q *dns.Msg, rcode int) *dns.Msg {
 	r := new(dns.Msg)
 	r.SetRcode(q, rcode)
-	r.RecursionAvailable = true
 
 	var name string
 	if len(q.Question) > 1 {

@@ -19,11 +19,15 @@
 
 package domain
 
+// "fqdn-insensitive" means the domain in Add() and Match() call
+// is fqdn-insensitive. "google.com" and "google.com." will get
+// the same outcome.
+// The logic for case-insensitive is the same as above.
+
 type Matcher[T any] interface {
 	// Match matches the domain s.
 	// s could be a fqdn or not, and should be case-insensitive.
 	Match(s string) (v T, ok bool)
-	Len() int
 }
 
 type WriteableMatcher[T any] interface {

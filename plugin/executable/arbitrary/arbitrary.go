@@ -20,52 +20,63 @@
 package arbitrary
 
 import (
+	"bytes"
 	"context"
 	"fmt"
-	"github.com/IrineSistiana/mosdns/v4/coremain"
-	"github.com/IrineSistiana/mosdns/v4/pkg/executable_seq"
-	"github.com/IrineSistiana/mosdns/v4/pkg/query_context"
-	"github.com/IrineSistiana/mosdns/v4/pkg/zone_file"
+	"github.com/IrineSistiana/mosdns/v5/coremain"
+	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v5/pkg/zone_file"
+	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
+	"os"
 	"strings"
 )
 
 const PluginType = "arbitrary"
 
 func init() {
-	coremain.RegNewPluginFunc(PluginType, Init, func() interface{} { return new(Args) })
+	coremain.RegNewPluginFunc(PluginType, Init, func() any { return new(Args) })
 }
 
 type Args struct {
-	RR []string `yaml:"rr"`
+	Rules []string `yaml:"rules"`
+	Files []string `yaml:"files"`
 }
 
-var _ coremain.ExecutablePlugin = (*arbitraryPlugin)(nil)
+var _ sequence.Executable = (*Arbitrary)(nil)
 
-type arbitraryPlugin struct {
-	*coremain.BP
+type Arbitrary struct {
 	m *zone_file.Matcher
 }
 
-func (p *arbitraryPlugin) Exec(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) error {
-	if r := p.m.Reply(qCtx.Q()); r != nil {
-		qCtx.SetResponse(r, query_context.ContextStatusResponded)
-		return nil
-	}
-	return executable_seq.ExecChainNode(ctx, qCtx, next)
-}
-
-func Init(bp *coremain.BP, v interface{}) (p coremain.Plugin, err error) {
-	args := v.(*Args)
+func NewArbitrary(args *Args) (*Arbitrary, error) {
 	m := new(zone_file.Matcher)
-
-	//TODO: Support data provider
-	for i, s := range args.RR {
+	for i, s := range args.Rules {
 		if err := m.Load(strings.NewReader(s)); err != nil {
 			return nil, fmt.Errorf("failed to load rr #%d [%s], %w", i, s, err)
 		}
 	}
-	return &arbitraryPlugin{
-		BP: bp,
-		m:  m,
+	for i, file := range args.Files {
+		b, err := os.ReadFile(file)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read file #%d [%s], %w", i, file, err)
+		}
+		if err := m.Load(bytes.NewReader(b)); err != nil {
+			return nil, fmt.Errorf("failed to load rr file #%d [%s], %w", i, file, err)
+		}
+	}
+	return &Arbitrary{
+		m: m,
 	}, nil
+}
+
+func (a *Arbitrary) Exec(_ context.Context, qCtx *query_context.Context) error {
+	if r := a.m.Reply(qCtx.Q()); r != nil {
+		qCtx.SetResponse(r)
+	}
+	return nil
+}
+
+func Init(_ *coremain.BP, v any) (any, error) {
+	args := v.(*Args)
+	return NewArbitrary(args)
 }

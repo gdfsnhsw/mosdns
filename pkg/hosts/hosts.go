@@ -22,8 +22,8 @@ package hosts
 import (
 	"errors"
 	"fmt"
-	"github.com/IrineSistiana/mosdns/v4/pkg/dnsutils"
-	"github.com/IrineSistiana/mosdns/v4/pkg/matcher/domain"
+	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
+	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/domain"
 	"github.com/miekg/dns"
 	"net/netip"
 	"strings"
@@ -66,7 +66,6 @@ func (h *Hosts) LookupMsg(m *dns.Msg) *dns.Msg {
 
 	r := new(dns.Msg)
 	r.SetReply(m)
-	r.RecursionAvailable = true
 	switch {
 	case typ == dns.TypeA && len(ipv4) > 0:
 		for _, ip := range ipv4 {

@@ -21,151 +21,173 @@ package dual_selector
 
 import (
 	"context"
-	"github.com/IrineSistiana/mosdns/v4/coremain"
-	"github.com/IrineSistiana/mosdns/v4/pkg/dnsutils"
-	"github.com/IrineSistiana/mosdns/v4/pkg/executable_seq"
-	"github.com/IrineSistiana/mosdns/v4/pkg/pool"
-	"github.com/IrineSistiana/mosdns/v4/pkg/query_context"
+	"io"
+	"time"
+
+	"github.com/IrineSistiana/mosdns/v5/pkg/cache"
+	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
+	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
+	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
-	"time"
 )
 
-const PluginType = "dual_selector"
-
 const (
-	modePreferIPv4 = iota
-	modePreferIPv6
+	referenceWaitTimeout     = time.Millisecond * 500
+	defaultSubRoutineTimeout = time.Second * 5
 
-	defaultWaitTimeout      = time.Millisecond * 250
-	defaultSubRoutineTimout = time.Second * 5
+	// TODO: Make cache configurable?
+	cacheSize       = 64 * 1024
+	cacheTlt        = time.Hour
+	cacheGcInterval = time.Minute
 )
 
 func init() {
-	coremain.RegNewPluginFunc(PluginType, Init, func() interface{} { return new(Args) })
-	coremain.RegNewPersetPluginFunc("_prefer_ipv4", func(bp *coremain.BP) (coremain.Plugin, error) {
-		return &Selector{BP: bp, mode: modePreferIPv4}, nil
+	sequence.MustRegExecQuickSetup("prefer_ipv4", func(bq sequence.BQ, _ string) (any, error) {
+		return NewPreferIpv4(bq), nil
 	})
-	coremain.RegNewPersetPluginFunc("_prefer_ipv6", func(bp *coremain.BP) (coremain.Plugin, error) {
-		return &Selector{BP: bp, mode: modePreferIPv6}, nil
+	sequence.MustRegExecQuickSetup("prefer_ipv6", func(bq sequence.BQ, _ string) (any, error) {
+		return NewPreferIpv6(bq), nil
 	})
 }
 
-type Args struct {
-	Mode        int `yaml:"mode"`
-	WaitTimeout int `yaml:"wait_timeout"`
-}
-
-var _ coremain.ExecutablePlugin = (*Selector)(nil)
+var _ sequence.RecursiveExecutable = (*Selector)(nil)
+var _ io.Closer = (*Selector)(nil)
 
 type Selector struct {
-	*coremain.BP
-	mode        int
-	waitTimeout time.Duration
-}
+	sequence.BQ
+	prefer uint16 // dns.TypeA or dns.TypeAAAA
 
-func (s *Selector) getWaitTimeout() time.Duration {
-	if s.waitTimeout <= 0 {
-		return defaultWaitTimeout
-	}
-	return s.waitTimeout
+	preferTypOkCache *cache.Cache[key, bool]
 }
 
 // Exec implements handler.Executable.
-func (s *Selector) Exec(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) error {
+func (s *Selector) Exec(ctx context.Context, qCtx *query_context.Context, next sequence.ChainWalker) error {
 	q := qCtx.Q()
 	if len(q.Question) != 1 { // skip wired query with multiple questions.
-		return executable_seq.ExecChainNode(ctx, qCtx, next)
+		return next.ExecNext(ctx, qCtx)
 	}
 
 	qtype := q.Question[0].Qtype
-	// skip queries that have preferred type or have other unrelated qtypes.
-	if (qtype == dns.TypeA && s.mode == modePreferIPv4) || (qtype == dns.TypeAAAA && s.mode == modePreferIPv6) || (qtype != dns.TypeA && qtype != dns.TypeAAAA) {
-		return executable_seq.ExecChainNode(ctx, qCtx, next)
+	// skip queries that have other unrelated types.
+	if qtype != dns.TypeA && qtype != dns.TypeAAAA {
+		return next.ExecNext(ctx, qCtx)
 	}
 
-	// start reference goroutine
-	qCtxRef := qCtx.Copy()
-	var refQtype uint16
-	if qtype == dns.TypeA {
-		refQtype = dns.TypeAAAA
-	} else {
-		refQtype = dns.TypeA
-	}
-	qCtxRef.Q().Question[0].Qtype = refQtype
-
-	ddl, ok := ctx.Deadline()
-	if !ok {
-		ddl = time.Now().Add(defaultSubRoutineTimout)
-	}
-
-	shouldBlock := make(chan struct{}, 0)
-	shouldPass := make(chan struct{}, 0)
-	ctxRef, cancelRef := context.WithDeadline(context.Background(), ddl)
-	go func() {
-		defer cancelRef()
-		err := executable_seq.ExecChainNode(ctxRef, qCtxRef, next)
+	qName := key(q.Question[0].Name)
+	if qtype == s.prefer {
+		err := next.ExecNext(ctx, qCtx)
 		if err != nil {
-			s.L().Warn("reference query routine err", qCtxRef.InfoField(), zap.Error(err))
+			return err
+		}
+
+		if r := qCtx.R(); r != nil && msgAnsHasRR(r, s.prefer) {
+			s.preferTypOkCache.Store(qName, true, time.Now().Add(cacheTlt))
+		}
+		return nil
+	}
+
+	// Qtype is not the preferred type.
+	preferredTypOk, _, _ := s.preferTypOkCache.Get(qName)
+	if preferredTypOk {
+		// We know that domain has preferred type so this qtype can be blocked
+		// right away.
+		r := dnsutils.GenEmptyReply(q, dns.RcodeSuccess)
+		qCtx.SetResponse(r)
+		return nil
+	}
+
+	// async check whether domain has the preferred type
+	qCtxPreferred := qCtx.Copy()
+	qCtxPreferred.Q().Question[0].Qtype = s.prefer
+
+	ddl, cacheOk := ctx.Deadline()
+	if !cacheOk {
+		ddl = time.Now().Add(defaultSubRoutineTimeout)
+	}
+
+	shouldBlock := make(chan struct{})
+	shouldPass := make(chan struct{})
+	go func() {
+		qCtx := qCtxPreferred
+		ctx, cancel := context.WithDeadline(context.Background(), ddl)
+		defer cancel()
+		err := next.ExecNext(ctx, qCtx)
+		if err != nil {
+			s.L().Warn("reference query routine err", qCtx.InfoField(), zap.Error(err))
 			close(shouldPass)
 			return
 		}
-		if r := qCtxRef.R(); r != nil && msgAnsHasRR(r, refQtype) {
-			// Target domain has reference type.
+		if r := qCtx.R(); r != nil && msgAnsHasRR(r, s.prefer) {
+			// Target domain has preferred type.
+			s.preferTypOkCache.Store(qName, true, time.Now().Add(cacheTlt))
 			close(shouldBlock)
 			return
 		}
 		close(shouldPass)
-		return
 	}()
 
 	// start original query goroutine
 	doneChan := make(chan error, 1)
-	qCtxSub := qCtx.Copy()
-	ctxSub, cancelSub := context.WithDeadline(context.Background(), ddl)
-	defer cancelSub()
+	qCtxOrg := qCtx.Copy()
 	go func() {
-		doneChan <- executable_seq.ExecChainNode(ctxSub, qCtxSub, next)
+		qCtx := qCtxOrg
+		ctx, cancel := context.WithDeadline(context.Background(), ddl)
+		defer cancel()
+		doneChan <- next.ExecNext(ctx, qCtx)
 	}()
 
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
-	case <-shouldBlock: // Reference indicates we should block this query before the original query finished.
+		return context.Cause(ctx)
+	case <-shouldBlock: // Domain has preferred type. Block this type now.
 		r := dnsutils.GenEmptyReply(q, dns.RcodeSuccess)
-		qCtx.SetResponse(r, query_context.ContextStatusResponded)
+		qCtx.SetResponse(r)
 		return nil
-	case err := <-doneChan: // The original query finished. Waiting for reference.
-		waitTimeoutTimer := pool.GetTimer(s.getWaitTimeout())
+	case err := <-doneChan: // The original query finished. Waiting for preferred type check.
+		waitTimeoutTimer := pool.GetTimer(referenceWaitTimeout)
 		defer pool.ReleaseTimer(waitTimeoutTimer)
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return context.Cause(ctx)
 		case <-shouldBlock:
 			r := dnsutils.GenEmptyReply(q, dns.RcodeSuccess)
-			qCtx.SetResponse(r, query_context.ContextStatusResponded)
+			qCtx.SetResponse(r)
 			return nil
 		case <-shouldPass:
-			*qCtx = *qCtxSub
+			*qCtx = *qCtxOrg // replace qCtx
 			return err
 		case <-waitTimeoutTimer.C:
 			// We have been waiting the reference query for too long.
 			// Something may go wrong. We accept the original reply.
-			*qCtx = *qCtxSub
+			*qCtx = *qCtxOrg
 			return err
 		}
 	}
 }
 
-func Init(bp *coremain.BP, args interface{}) (p coremain.Plugin, err error) {
-	return NewDualSelector(bp, args.(*Args)), nil
+func (s *Selector) Close() error {
+	s.preferTypOkCache.Close()
+	return nil
 }
 
-func NewDualSelector(bp *coremain.BP, args *Args) *Selector {
+func NewPreferIpv4(bq sequence.BQ) *Selector {
+	return newSelector(bq, dns.TypeA)
+}
+
+func NewPreferIpv6(bq sequence.BQ) *Selector {
+	return newSelector(bq, dns.TypeAAAA)
+}
+
+func newSelector(bq sequence.BQ, preferType uint16) *Selector {
+	if preferType != dns.TypeA && preferType != dns.TypeAAAA {
+		panic("dual_selector: invalid dns qtype")
+	}
 	return &Selector{
-		BP:          bp,
-		mode:        args.Mode,
-		waitTimeout: time.Duration(args.WaitTimeout) * time.Millisecond,
+		BQ:               bq,
+		prefer:           preferType,
+		preferTypOkCache: cache.New[key, bool](cache.Opts{Size: cacheSize, CleanerInterval: cacheGcInterval}),
 	}
 }
 

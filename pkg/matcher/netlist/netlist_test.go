@@ -21,7 +21,7 @@ package netlist
 
 import (
 	"bytes"
-	"net"
+	"net/netip"
 	"testing"
 )
 
@@ -34,6 +34,7 @@ func TestIPNetList_Sort_And_Merge(t *testing.T) {
 192.168.9.24/24 # merged
 192.168.3.0/24 # merged
 192.169.0.0/16
+104.16.0.0/12
 `
 	ipNetList := NewList()
 	err := LoadFromReader(ipNetList, bytes.NewBufferString(raw))
@@ -42,27 +43,29 @@ func TestIPNetList_Sort_And_Merge(t *testing.T) {
 	}
 	ipNetList.Sort()
 
-	if ipNetList.Len() != 2 {
+	if ipNetList.Len() != 3 {
 		t.Fatalf("unexpected length %d", ipNetList.Len())
 	}
 
 	tests := []struct {
 		name   string
-		testIP net.IP
+		testIP netip.Addr
 		want   bool
 	}{
-		{"0", net.IPv4(192, 167, 255, 255), false},
-		{"1", net.IPv4(192, 168, 0, 0), true},
-		{"2", net.IPv4(192, 168, 1, 1), true},
-		{"3", net.IPv4(192, 168, 9, 255), true},
-		{"4", net.IPv4(192, 168, 255, 255), true},
-		{"5", net.IPv4(192, 169, 1, 1), true},
-		{"6", net.IPv4(192, 170, 1, 1), false},
-		{"7", net.IPv4(1, 1, 1, 1), false},
+		{"0", netip.MustParseAddr("192.167.255.255"), false},
+		{"1", netip.MustParseAddr("192.168.0.0"), true},
+		{"2", netip.MustParseAddr("192.168.1.1"), true},
+		{"3", netip.MustParseAddr("192.168.9.255"), true},
+		{"4", netip.MustParseAddr("192.168.255.255"), true},
+		{"5", netip.MustParseAddr("192.169.1.1"), true},
+		{"6", netip.MustParseAddr("192.170.1.1"), false},
+		{"7", netip.MustParseAddr("1.1.1.1"), false},
+		{"8", netip.MustParseAddr("104.16.67.38"), true},
+		{"9", netip.MustParseAddr("104.32.67.38"), false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got, _ := ipNetList.Match(tt.testIP); got != tt.want {
+			if got := ipNetList.Match(tt.testIP); got != tt.want {
 				t.Errorf("IPNetList.Match() = %v, want %v", got, tt.want)
 			}
 		})
@@ -78,9 +81,6 @@ func TestIPNetList_New_And_Contains(t *testing.T) {
 
 2000:0000::/32
 2000:2000::1
-
-# issue https://github.com/IrineSistiana/mosdns/issues/76
-127.0.0.0/8
 `
 
 	ipNetList := NewList()
@@ -92,27 +92,25 @@ func TestIPNetList_New_And_Contains(t *testing.T) {
 
 	tests := []struct {
 		name   string
-		testIP net.IP
+		testIP netip.Addr
 		want   bool
 	}{
-		{"", net.ParseIP("1.0.0.0"), true},
-		{"", net.ParseIP("1.0.0.1"), true},
-		{"", net.ParseIP("1.0.1.0"), false},
-		{"", net.ParseIP("2.0.0.0"), true},
-		{"", net.ParseIP("2.0.1.255"), true},
-		{"", net.ParseIP("2.0.2.0"), false},
-		{"", net.ParseIP("3.0.0.0"), true},
-		{"", net.ParseIP("2000:0000::"), true},
-		{"", net.ParseIP("2000:0000::1"), true},
-		{"", net.ParseIP("2000:0000:1::"), true},
-		{"", net.ParseIP("2000:0001::"), false},
-		{"", net.ParseIP("2000:2000::1"), true},
-		{"https://github.com/IrineSistiana/mosdns/issues/76", net.IPv4(127, 0, 0, 1), true},
-		{"https://github.com/IrineSistiana/mosdns/issues/76", net.IP{127, 0, 0, 1}, true},
+		{"", netip.MustParseAddr("1.0.0.0"), true},
+		{"", netip.MustParseAddr("1.0.0.1"), true},
+		{"", netip.MustParseAddr("1.0.1.0"), false},
+		{"", netip.MustParseAddr("2.0.0.0"), true},
+		{"", netip.MustParseAddr("2.0.1.255"), true},
+		{"", netip.MustParseAddr("2.0.2.0"), false},
+		{"", netip.MustParseAddr("3.0.0.0"), true},
+		{"", netip.MustParseAddr("2000:0000::"), true},
+		{"", netip.MustParseAddr("2000:0000::1"), true},
+		{"", netip.MustParseAddr("2000:0000:1::"), true},
+		{"", netip.MustParseAddr("2000:0001::"), false},
+		{"", netip.MustParseAddr("2000:2000::1"), true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got, _ := ipNetList.Match(tt.testIP); got != tt.want {
+			if got := ipNetList.Match(tt.testIP); got != tt.want {
 				t.Errorf("IPNetList.Match() = %v, want %v", got, tt.want)
 			}
 		})

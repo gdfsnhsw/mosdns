@@ -19,9 +19,10 @@
 
 package netlist
 
-import "net"
+import (
+	"net/netip"
+)
 
 type Matcher interface {
-	Match(ip net.IP) (bool, error)
-	Len() int
+	Match(addr netip.Addr) bool
 }

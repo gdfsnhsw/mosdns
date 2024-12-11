@@ -94,7 +94,7 @@ type TestArgsStruct struct {
 
 func Test_WeakDecode(t *testing.T) {
 	testObj := new(TestArgsStruct)
-	testArgs := map[string]interface{}{
+	testArgs := map[string]any{
 		"1": "test",
 		"2": []int{1, 2, 3},
 	}
@@ -110,5 +110,14 @@ func Test_WeakDecode(t *testing.T) {
 
 	if !reflect.DeepEqual(testObj, wantObj) {
 		t.Fatalf("args decode failed, want %v, got %v", wantObj, testObj)
+	}
+}
+
+func Test_WeakDecode2(t *testing.T) {
+	testObj := new([]byte)
+	args := []any{"1", 2, 3}
+	err := WeakDecode(args, testObj)
+	if err != nil {
+		t.Fatal(err)
 	}
 }

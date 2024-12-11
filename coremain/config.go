@@ -20,56 +20,29 @@
 package coremain
 
 import (
-	"github.com/IrineSistiana/mosdns/v4/mlog"
-	"github.com/IrineSistiana/mosdns/v4/pkg/data_provider"
+	"github.com/IrineSistiana/mosdns/v5/mlog"
 )
 
 type Config struct {
-	Log           mlog.LogConfig                     `yaml:"log"`
-	Include       []string                           `yaml:"include"`
-	DataProviders []data_provider.DataProviderConfig `yaml:"data_providers"`
-	Plugins       []PluginConfig                     `yaml:"plugins"`
-	Servers       []ServerConfig                     `yaml:"servers"`
-	API           APIConfig                          `yaml:"api"`
+	Log     mlog.LogConfig `yaml:"log"`
+	Include []string       `yaml:"include"`
+	Plugins []PluginConfig `yaml:"plugins"`
+	API     APIConfig      `yaml:"api"`
 }
 
 // PluginConfig represents a plugin config
 type PluginConfig struct {
-	// Tag, required
+	// Tag for this plugin. Optional. If omitted, this plugin will
+	// be registered with a random tag.
 	Tag string `yaml:"tag"`
 
-	// Type, required
+	// Type, required.
 	Type string `yaml:"type"`
 
-	// Args, might be required by some plugins
-	Args map[string]interface{} `yaml:"args"`
-}
-
-type ServerConfig struct {
-	Exec      string                  `yaml:"exec"`
-	Timeout   uint                    `yaml:"timeout"` // (sec) query timeout.
-	Listeners []*ServerListenerConfig `yaml:"listeners"`
-}
-
-type ServerListenerConfig struct {
-	// Protocol: server protocol, can be:
-	// "", "udp" -> udp
-	// "tcp" -> tcp
-	// "dot", "tls" -> dns over tls
-	// "doh", "https" -> dns over https (rfc 8844)
-	// "http" -> dns over https (rfc 8844) but without tls
-	Protocol string `yaml:"protocol"`
-
-	// Addr: server "host:port" addr.
-	// Addr cannot be empty.
-	Addr string `yaml:"addr"`
-
-	Cert                string `yaml:"cert"`                    // certificate path, used by dot, doh
-	Key                 string `yaml:"key"`                     // certificate key path, used by dot, doh
-	URLPath             string `yaml:"url_path"`                // used by doh, http. If it's empty, any path will be handled.
-	GetUserIPFromHeader string `yaml:"get_user_ip_from_header"` // used by doh, http.
-
-	IdleTimeout uint `yaml:"idle_timeout"` // (sec) used by tcp, dot, doh as connection idle timeout.
+	// Args, might be required by some plugins.
+	// The type of Args is depended on RegNewPluginFunc.
+	// If it's a map[string]any, it will be converted by mapstruct.
+	Args any `yaml:"args"`
 }
 
 type APIConfig struct {

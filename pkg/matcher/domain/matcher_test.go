@@ -21,12 +21,11 @@ package domain
 
 import (
 	"reflect"
-	"strconv"
 	"testing"
 )
 
-func assertFunc[T any](t *testing.T, m Matcher[T]) func(domain string, wantBool bool, wantV interface{}) {
-	return func(domain string, wantBool bool, wantV interface{}) {
+func assertFunc[T any](t *testing.T, m Matcher[T]) func(domain string, wantBool bool, wantV any) {
+	return func(domain string, wantBool bool, wantV any) {
 		t.Helper()
 		v, ok := m.Match(domain)
 		if ok != wantBool {
@@ -47,7 +46,7 @@ func s(str string) *aStr {
 	return &aStr{s: str}
 }
 
-func (a *aStr) Append(v interface{}) {
+func (a *aStr) Append(v any) {
 	a.s = a.s + v.(*aStr).s
 }
 
@@ -87,6 +86,14 @@ func TestDomainMatcher(t *testing.T) {
 	assert("b.sub", true, 1)
 	assert("a.sub", true, 2)
 	assert("a.a.sub", true, 2)
+
+	// test case-insensitive
+	add("UPpER", 1)
+	assert("LowER.Upper", true, 1)
+
+	// root match
+	add(".", 9)
+	assert("any.domain", true, 9)
 }
 
 func assertInt(t testing.TB, want, got int) {
@@ -99,7 +106,7 @@ func assertInt(t testing.TB, want, got int) {
 func Test_FullMatcher(t *testing.T) {
 	m := NewFullMatcher[any]()
 	assert := assertFunc[any](t, m)
-	add := func(domain string, v interface{}) {
+	add := func(domain string, v any) {
 		m.Add(domain, v)
 	}
 
@@ -119,11 +126,15 @@ func Test_FullMatcher(t *testing.T) {
 	assert("append", true, nil)
 
 	assertInt(t, m.Len(), 3)
+
+	// test case-insensitive
+	add("UPpER", 1)
+	assert("Upper", true, 1)
 }
 
 func Test_KeywordMatcher(t *testing.T) {
 	m := NewKeywordMatcher[any]()
-	add := func(domain string, v interface{}) {
+	add := func(domain string, v any) {
 		m.Add(domain, v)
 	}
 
@@ -146,11 +157,15 @@ func Test_KeywordMatcher(t *testing.T) {
 	assert("append", true, nil)
 
 	assertInt(t, m.Len(), 3)
+
+	// test case-insensitive
+	add("UPpER", 1)
+	assert("L.Upper.U", true, 1)
 }
 
 func Test_RegexMatcher(t *testing.T) {
 	m := NewRegexMatcher[any]()
-	add := func(expr string, v interface{}, wantErr bool) {
+	add := func(expr string, v any, wantErr bool) {
 		err := m.Add(expr, v)
 		if (err != nil) != wantErr {
 			t.Fatalf("%s: want err %v, got %v", expr, wantErr, err != nil)
@@ -182,23 +197,4 @@ func Test_RegexMatcher(t *testing.T) {
 
 	expr = "*"
 	add(expr, nil, true)
-}
-
-func Test_regCache(t *testing.T) {
-	c := newRegCache[any](128)
-	for i := 0; i < 1024; i++ {
-		s := strconv.Itoa(i)
-		res := new(regElem[any])
-		c.cache(s, res)
-		if len(c.m) > 128 {
-			t.Fatal("cache overflowed")
-		}
-		got, ok := c.lookup(s)
-		if !ok {
-			t.Fatal("cache lookup failed")
-		}
-		if got != res {
-			t.Fatal("cache item mismatched")
-		}
-	}
 }

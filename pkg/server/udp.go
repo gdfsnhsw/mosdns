@@ -22,88 +22,88 @@ package server
 import (
 	"context"
 	"fmt"
-	"github.com/IrineSistiana/mosdns/v4/pkg/pool"
-	"github.com/IrineSistiana/mosdns/v4/pkg/query_context"
-	"github.com/IrineSistiana/mosdns/v4/pkg/utils"
+	"net"
+
+	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
-	"io"
-	"net"
 )
 
-type udpResponseWriter struct {
-	c       net.PacketConn
-	to      net.Addr
-	udpSize int
+type UDPServerOpts struct {
+	Logger *zap.Logger
 }
 
-func (w *udpResponseWriter) Write(m *dns.Msg) error {
-	m.Truncate(w.udpSize)
-	b, buf, err := pool.PackBuffer(m)
+// ServeUDP starts a server at c. It returns if c had a read error.
+// It always returns a non-nil error.
+// h is required. logger is optional.
+func ServeUDP(c *net.UDPConn, h Handler, opts UDPServerOpts) error {
+	logger := opts.Logger
+	if logger == nil {
+		logger = nopLogger
+	}
+
+	listenerCtx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(errListenerCtxCanceled)
+
+	rb := pool.GetBuf(dns.MaxMsgSize)
+	defer pool.ReleaseBuf(rb)
+
+	oobReader, oobWriter, err := initOobHandler(c)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to init oob handler, %w", err)
 	}
-	defer buf.Release()
-	_, err = w.c.WriteTo(b, w.to)
-	return err
-}
-
-func (s *Server) ServeUDP(c net.PacketConn) error {
-	defer c.Close()
-
-	closer := io.Closer(c)
-	if ok := s.trackCloser(&closer, true); !ok {
-		return ErrServerClosed
+	var ob []byte
+	if oobReader != nil {
+		obp := pool.GetBuf(1024)
+		defer pool.ReleaseBuf(obp)
+		ob = *obp
 	}
-	defer s.trackCloser(&closer, false)
-
-	listenerCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	readBuf := pool.GetBuf(64 * 1024)
-	defer readBuf.Release()
-	rb := readBuf.Bytes()
 
 	for {
-		n, from, err := c.ReadFrom(rb)
+		n, oobn, _, remoteAddr, err := c.ReadMsgUDPAddrPort(*rb, ob)
 		if err != nil {
-			if s.Closed() {
-				return ErrServerClosed
+			if n == 0 {
+				// Err with zero read. Most likely because c was closed.
+				return fmt.Errorf("unexpected read err: %w", err)
 			}
-			return fmt.Errorf("unexpected read err: %w", err)
-		}
-
-		req := new(dns.Msg)
-		if err := req.Unpack(rb[:n]); err != nil {
-			s.getLogger().Warn("invalid msg", zap.Error(err), zap.Binary("msg", rb[:n]))
+			// Temporary err.
+			logger.Warn("read err", zap.Error(err))
 			continue
 		}
 
-		go func() {
-			meta := new(query_context.RequestMeta)
-			meta.FromUDP = true
-			if clientIP := utils.GetIPFromAddr(from); clientIP != nil {
-				meta.ClientIP = clientIP
-			} else {
-				s.getLogger().Warn("failed to acquire client ip addr")
+		q := new(dns.Msg)
+		if err := q.Unpack((*rb)[:n]); err != nil {
+			logger.Warn("invalid msg", zap.Error(err), zap.Binary("msg", (*rb)[:n]), zap.Stringer("from", remoteAddr))
+			continue
+		}
+
+		var dstIpFromCm net.IP
+		if oobReader != nil {
+			var err error
+			dstIpFromCm, err = oobReader(ob[:oobn])
+			if err != nil {
+				logger.Error("failed to get dst address from oob", zap.Error(err))
 			}
+		}
 
-			w := &udpResponseWriter{c: c, to: from, udpSize: getUDPSize(req)}
+		// handle query
+		go func() {
+			payload := h.Handle(listenerCtx, q, QueryMeta{ClientAddr: remoteAddr.Addr(), FromUDP: true}, pool.PackBuffer)
+			if payload == nil {
+				return
+			}
+			defer pool.ReleaseBuf(payload)
 
-			if err := s.DNSHandler.ServeDNS(listenerCtx, req, w, meta); err != nil {
-				s.getLogger().Warn("handler err", zap.Error(err))
+			var oob []byte
+			if oobWriter != nil && dstIpFromCm != nil {
+				oob = oobWriter(dstIpFromCm)
+			}
+			if _, _, err := c.WriteMsgUDPAddrPort(*payload, oob, remoteAddr); err != nil {
+				logger.Warn("failed to write response", zap.Stringer("client", remoteAddr), zap.Error(err))
 			}
 		}()
 	}
 }
 
-func getUDPSize(m *dns.Msg) int {
-	var s uint16
-	if opt := m.IsEdns0(); opt != nil {
-		s = opt.UDPSize()
-	}
-	if s < dns.MinMsgSize {
-		s = dns.MinMsgSize
-	}
-	return int(s)
-}
+type getSrcAddrFromOOB func(oob []byte) (net.IP, error)
+type writeSrcAddrToOOB func(a net.IP) []byte

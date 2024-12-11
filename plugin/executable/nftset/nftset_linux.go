@@ -24,115 +24,126 @@ package nftset
 import (
 	"context"
 	"fmt"
-	"github.com/IrineSistiana/mosdns/v4/coremain"
-	"github.com/IrineSistiana/mosdns/v4/pkg/executable_seq"
-	"github.com/IrineSistiana/mosdns/v4/pkg/nftset_utils"
-	"github.com/IrineSistiana/mosdns/v4/pkg/query_context"
+	"net/netip"
+
+	"github.com/IrineSistiana/mosdns/v5/pkg/nftset_utils"
+	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/google/nftables"
 	"github.com/miekg/dns"
-	"go.uber.org/zap"
 )
 
-type nftsetPlugin struct {
-	*coremain.BP
-	v4set *nftset_utils.NtSetHandler
-	v6set *nftset_utils.NtSetHandler
-	args  *Args
+type nftSetPlugin struct {
+	args      *Args
+	v4Handler *nftset_utils.NftSetHandler
+	v6Handler *nftset_utils.NftSetHandler
 }
 
-func newNftsetPlugin(bp *coremain.BP, args *Args) (*nftsetPlugin, error) {
-	if m := args.Mask4; m <= 0 || m > 32 {
-		args.Mask4 = 24
+func newNftSetPlugin(args *Args) (*nftSetPlugin, error) {
+	utils.SetDefaultUnsignNum(&args.IPv4.Mask, 24)
+	utils.SetDefaultUnsignNum(&args.IPv6.Mask, 48)
+	if m := args.IPv4.Mask; m > 32 {
+		return nil, fmt.Errorf("invalid ipv4 mask %d", m)
 	}
-	if m := args.Mask6; m <= 0 || m > 128 {
-		args.Mask6 = 32
+	if m := args.IPv6.Mask; m > 128 {
+		return nil, fmt.Errorf("invalid ipv6 mask %d", m)
 	}
 
-	nftPlugin := &nftsetPlugin{
-		BP:   bp,
+	p := &nftSetPlugin{
 		args: args,
 	}
 
-	if len(args.TableFamily4) > 0 && len(args.TableName4) > 0 && len(args.SetName4) > 0 {
-		f, ok := parseTableFamily(args.TableFamily4)
-		if !ok {
-			return nil, fmt.Errorf("unsupported nftables family for set4 [%s]", args.TableFamily4)
+	newHandler := func(sa SetArgs) (*nftset_utils.NftSetHandler, error) {
+		if !(len(sa.Table) > 0 && len(sa.TableFamily) > 0 && len(sa.Set) > 0) {
+			return nil, nil
 		}
-		nftPlugin.v4set = nftset_utils.NewNtSetHandler(f, args.TableName4, args.SetName4)
-	}
-
-	if len(args.TableFamily6) > 0 && len(args.TableName6) > 0 && len(args.SetName6) > 0 {
-		f, ok := parseTableFamily(args.TableFamily6)
+		f, ok := parseTableFamily(sa.TableFamily)
 		if !ok {
-			return nil, fmt.Errorf("unsupported nftables family for set6 [%s]", args.TableFamily6)
+			return nil, fmt.Errorf("unsupported nftables family [%s]", sa.TableFamily)
 		}
-		nftPlugin.v6set = nftset_utils.NewNtSetHandler(f, args.TableName6, args.SetName6)
+		return nftset_utils.NewNtSetHandler(nftset_utils.HandlerOpts{
+			TableFamily: f,
+			TableName:   sa.Table,
+			SetName:     sa.Set,
+		}), nil
 	}
-
-	return nftPlugin, nil
+	var err error
+	p.v4Handler, err = newHandler(args.IPv4)
+	if err != nil {
+		return nil, err
+	}
+	p.v6Handler, err = newHandler(args.IPv6)
+	if err != nil {
+		_ = p.v4Handler.Close()
+		return nil, err
+	}
+	return p, nil
 }
 
-// Exec tries to add all qCtx.R() IPs to system nftables.
-// If an error occurred, Exec will just log it.
-// Therefore, Exec will never raise its own error.
-func (p *nftsetPlugin) Exec(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) error {
+func (p *nftSetPlugin) Exec(_ context.Context, qCtx *query_context.Context) error {
 	r := qCtx.R()
 	if r != nil {
-		er := p.addElems(r)
-		if er != nil {
-			p.L().Warn("failed to add elems to nftables", qCtx.InfoField(), zap.Error(er))
+		if err := p.addElems(r); err != nil {
+			return fmt.Errorf("nftable: %w", err)
 		}
 	}
-
-	return executable_seq.ExecChainNode(ctx, qCtx, next)
+	return nil
 }
 
-func (p *nftsetPlugin) addElems(r *dns.Msg) error {
-	var v4Elems []*nftset_utils.SetIPElem
-	var v6Elems []*nftset_utils.SetIPElem
+func (p *nftSetPlugin) addElems(r *dns.Msg) error {
+	var v4Elems []netip.Prefix
+	var v6Elems []netip.Prefix
 
 	for i := range r.Answer {
 		switch rr := r.Answer[i].(type) {
 		case *dns.A:
-			if p.v4set == nil {
+			if p.v4Handler == nil {
 				continue
 			}
-			ipv4 := rr.A.To4()
-			if ipv4 == nil {
+			addr, ok := netip.AddrFromSlice(rr.A)
+			addr = addr.Unmap()
+			if !ok || !addr.Is4() {
 				return fmt.Errorf("internel: dns.A record [%s] is not a ipv4 address", rr.A)
 			}
-			v4Elems = append(v4Elems, &nftset_utils.SetIPElem{
-				IP:   ipv4,
-				Mask: p.args.Mask4,
-			})
+			v4Elems = append(v4Elems, netip.PrefixFrom(addr, p.args.IPv4.Mask))
 
 		case *dns.AAAA:
-			if p.v6set == nil {
+			if p.v6Handler == nil {
 				continue
 			}
-			ipv6 := rr.AAAA.To16()
-			if ipv6 == nil {
-				return fmt.Errorf("internel: dns.A record [%s] is not a ipv6 address", rr.AAAA)
+			addr, ok := netip.AddrFromSlice(rr.AAAA)
+			if !ok {
+				return fmt.Errorf("internel: dns.AAAA record [%s] is not a ipv6 address", rr.AAAA)
 			}
-			v6Elems = append(v6Elems, &nftset_utils.SetIPElem{
-				IP:   ipv6,
-				Mask: p.args.Mask6,
-			})
+			if addr.Is4() {
+				addr = netip.AddrFrom16(addr.As16())
+			}
+			v6Elems = append(v6Elems, netip.PrefixFrom(addr, p.args.IPv6.Mask))
 		default:
 			continue
 		}
 	}
 
-	if p.v4set != nil && len(v4Elems) > 0 {
-		if err := p.v4set.AddElems(v4Elems); err != nil {
+	if p.v4Handler != nil && len(v4Elems) > 0 {
+		if err := p.v4Handler.AddElems(v4Elems...); err != nil {
 			return fmt.Errorf("failed to add ipv4 elems %s: %w", v4Elems, err)
 		}
 	}
 
-	if p.v6set != nil && len(v6Elems) > 0 {
-		if err := p.v6set.AddElems(v6Elems); err != nil {
+	if p.v6Handler != nil && len(v6Elems) > 0 {
+		if err := p.v6Handler.AddElems(v6Elems...); err != nil {
 			return fmt.Errorf("failed to add ipv6 elems %s: %w", v6Elems, err)
 		}
+	}
+	return nil
+}
+
+func (p *nftSetPlugin) Close() error {
+	if p.v4Handler != nil {
+		_ = p.v4Handler.Close()
+	}
+	if p.v6Handler != nil {
+		_ = p.v6Handler.Close()
 	}
 	return nil
 }

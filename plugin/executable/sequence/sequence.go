@@ -21,61 +21,57 @@ package sequence
 
 import (
 	"context"
-	"fmt"
-	"github.com/IrineSistiana/mosdns/v4/coremain"
-	"github.com/IrineSistiana/mosdns/v4/pkg/executable_seq"
-	"github.com/IrineSistiana/mosdns/v4/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v5/coremain"
+	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 )
 
 const PluginType = "sequence"
 
 func init() {
-	coremain.RegNewPluginFunc(PluginType, Init, func() interface{} { return new(Args) })
-	coremain.RegNewPersetPluginFunc("_return", func(bp *coremain.BP) (coremain.Plugin, error) {
-		return &_return{BP: bp}, nil
-	})
+	coremain.RegNewPluginFunc(PluginType, Init, func() any { return new(Args) })
+
+	MustRegExecQuickSetup("accept", setupAccept)
+	MustRegExecQuickSetup("reject", setupReject)
+	MustRegExecQuickSetup("return", setupReturn)
+	MustRegExecQuickSetup("goto", setupGoto)
+	MustRegExecQuickSetup("jump", setupJump)
+	MustRegMatchQuickSetup("_true", setupTrue) // add _ prefix to avoid being mis-parsed as bool
+	MustRegMatchQuickSetup("_false", setupFalse)
 }
 
-type sequence struct {
-	*coremain.BP
-
-	ecs executable_seq.ExecutableChainNode
+type Sequence struct {
+	chain            []*ChainNode
+	anonymousPlugins []any
 }
 
-type Args struct {
-	Exec interface{} `yaml:"exec"`
-}
-
-func Init(bp *coremain.BP, args interface{}) (p coremain.Plugin, err error) {
-	return newSequencePlugin(bp, args.(*Args))
-}
-
-func newSequencePlugin(bp *coremain.BP, args *Args) (*sequence, error) {
-	ecs, err := executable_seq.BuildExecutableLogicTree(args.Exec, bp.L(), bp.M().GetExecutables(), bp.M().GetMatchers())
-	if err != nil {
-		return nil, fmt.Errorf("cannot build sequence: %w", err)
+func (s *Sequence) Close() error {
+	for _, plugin := range s.anonymousPlugins {
+		closePlugin(plugin)
 	}
-
-	return &sequence{
-		BP:  bp,
-		ecs: ecs,
-	}, nil
-}
-
-func (s *sequence) Exec(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) error {
-	if err := executable_seq.ExecChainNode(ctx, qCtx, s.ecs); err != nil {
-		return err
-	}
-
-	return executable_seq.ExecChainNode(ctx, qCtx, next)
-}
-
-var _ coremain.ExecutablePlugin = (*_return)(nil)
-
-type _return struct {
-	*coremain.BP
-}
-
-func (n *_return) Exec(_ context.Context, _ *query_context.Context, _ executable_seq.ExecutableChainNode) error {
 	return nil
+}
+
+type Args = []RuleArgs
+
+func Init(bp *coremain.BP, args any) (any, error) {
+	return NewSequence(bp, *args.(*Args))
+}
+
+func NewSequence(bq BQ, ra []RuleArgs) (*Sequence, error) {
+	s := &Sequence{}
+
+	var rc []RuleConfig
+	for _, ra := range ra {
+		rc = append(rc, parseArgs(ra))
+	}
+	if err := s.buildChain(bq, rc); err != nil {
+		_ = s.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *Sequence) Exec(ctx context.Context, qCtx *query_context.Context) error {
+	walker := NewChainWalker(s.chain, nil)
+	return walker.ExecNext(ctx, qCtx)
 }
